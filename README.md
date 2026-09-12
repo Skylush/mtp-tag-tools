@@ -10,6 +10,7 @@
 - 按用户设置独立 Ad Tag
 - 为用户配置独立端口
 - 快速查看客户端连接链接
+- 可选的断网检测与 Telemt 服务自愈
 - 修改前自动备份配置
 - Telemt 启动失败时自动回滚
 
@@ -77,6 +78,56 @@ TAG 写入成功后，还需要在 Bot 中设置赞助频道：
 5. 等待 Telegram 服务端同步，通常需要约 1 小时。
 
 已订阅该频道的账号不会看到赞助位。请使用未订阅该频道的账号测试。
+
+## 可选：断网检测与服务自愈
+
+完整安装结束时，脚本会询问：
+
+```text
+是否启用【断网检测 + Telemt 服务自愈】附属功能？[Y/n]
+```
+
+直接回车即可启用。也可在主菜单选择：
+
+```text
+8. 断网检测 + Telemt 服务自愈监控
+```
+
+自愈模块默认每 2 分钟检查一次：
+
+- VPS 完全断网时只记录状态，不反复重启 Telemt。
+- 网络恢复后重启一次 Telemt，重建 Telegram Middle Proxy 连接池。
+- Telemt 停止或任一配置端口未监听时，连续检查失败 3 次后才重启。
+- 同时检查主端口和 `[access.user_ports]` 中的所有用户独立端口。
+- 通过文件锁防止多个监控任务重复执行。
+
+查看监控定时器：
+
+```bash
+systemctl status telemt-watchdog.timer --no-pager
+```
+
+查看自愈日志：
+
+```bash
+tail -n 100 /var/log/telemt-watchdog.log
+```
+
+手动执行一次健康检查：
+
+```bash
+/usr/local/sbin/telemt-watchdog
+```
+
+默认设置保存在 `/etc/telemt-watchdog.conf`：
+
+```bash
+FAIL_THRESHOLD=3
+RESTART_ON_NETWORK_RECOVERY=1
+CHECK_TIMEOUT=6
+```
+
+如果不希望在网络恢复时主动重启 Telemt，可将 `RESTART_ON_NETWORK_RECOVERY` 改为 `0`。也可通过主菜单选项 8 完整关闭或重新安装监控。
 
 ## 查看代理链接
 

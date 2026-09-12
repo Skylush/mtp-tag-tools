@@ -197,9 +197,15 @@ install_telemt() {
     read -r -p "获取 TAG 后按 Enter 继续（输入 s 可暂时跳过）: " answer
     if [[ "$answer" =~ ^[sS]$ ]]; then
         echo -e "${YELLOW}已跳过 TAG，以后重新运行本脚本即可绑定。${PLAIN}"
-        return 0
+    else
+        set_global_tag
     fi
-    set_global_tag
+
+    echo
+    read -r -p "是否启用【断网检测 + Telemt 服务自愈】附属功能？[Y/n]: " answer
+    if ! [[ "$answer" =~ ^[nN]$ ]]; then
+        install_watchdog
+    fi
 }
 
 # 在指定 TOML section 中设置/删除键。
@@ -386,6 +392,293 @@ show_diagnostics() {
     fi
 }
 
+install_watchdog() {
+    find_config || { echo -e "${RED}请先安装 Telemt。${PLAIN}"; return 1; }
+    command -v python3 >/dev/null 2>&1 || die "断网监控需要 python3。"
+
+    cat > /usr/local/sbin/telemt-watchdog <<'WATCHDOG'
+#!/usr/bin/env bash
+
+set -u
+
+CONF_FILE=/etc/telemt-watchdog.conf
+STATE_FILE=/run/telemt-watchdog.state
+LOCK_FILE=/run/telemt-watchdog.lock
+LOG_FILE=/var/log/telemt-watchdog.log
+
+FAIL_THRESHOLD=3
+RESTART_ON_NETWORK_RECOVERY=1
+CHECK_TIMEOUT=6
+
+[ -f "$CONF_FILE" ] && . "$CONF_FILE"
+
+log_msg() {
+    local message="$*" now
+    now="$(date '+%Y-%m-%d %H:%M:%S')"
+    printf '%s %s\n' "$now" "$message" >> "$LOG_FILE" 2>/dev/null || true
+    command -v logger >/dev/null 2>&1 && logger -t telemt-watchdog -- "$message" || true
+}
+
+exec 9>"$LOCK_FILE"
+if command -v flock >/dev/null 2>&1; then
+    flock -n 9 || exit 0
+fi
+
+FAILURES=0
+WAS_OFFLINE=0
+if [ -f "$STATE_FILE" ]; then
+    . "$STATE_FILE"
+fi
+[[ "${FAILURES:-0}" =~ ^[0-9]+$ ]] || FAILURES=0
+[[ "${WAS_OFFLINE:-0}" =~ ^[01]$ ]] || WAS_OFFLINE=0
+
+save_state() {
+    printf 'FAILURES=%s\nWAS_OFFLINE=%s\n' "$FAILURES" "$WAS_OFFLINE" > "$STATE_FILE"
+}
+
+tcp_probe() {
+    local host="$1" port="$2"
+    timeout "$CHECK_TIMEOUT" bash -c "</dev/tcp/${host}/${port}" >/dev/null 2>&1
+}
+
+network_ok() {
+    tcp_probe 149.154.175.50 443 || tcp_probe 91.108.56.122 443 || tcp_probe 1.1.1.1 443
+}
+
+service_active() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active --quiet telemt
+    else
+        rc-service telemt status 2>/dev/null | grep -q started
+    fi
+}
+
+restart_service() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart telemt
+    else
+        rc-service telemt restart
+    fi
+}
+
+find_telemt_config() {
+    if [ -f /etc/telemt.toml ]; then
+        printf '%s' /etc/telemt.toml
+    elif [ -f /etc/telemt/telemt.toml ]; then
+        printf '%s' /etc/telemt/telemt.toml
+    fi
+}
+
+configured_ports() {
+    local cfg="$1"
+    python3 - "$cfg" <<'PY'
+import re, sys
+section = ''
+ports = []
+for raw in open(sys.argv[1], encoding='utf-8'):
+    line = raw.strip()
+    header = re.match(r'^\[([^]]+)]', line)
+    if header:
+        section = header.group(1).strip()
+        continue
+    if section == 'server':
+        match = re.match(r'^port\s*=\s*([0-9]+)', line)
+        if match:
+            ports.append(match.group(1))
+    elif section == 'access.user_ports':
+        match = re.match(r'^(?:"[^"]+"|[A-Za-z0-9_-]+)\s*=\s*([0-9]+)', line)
+        if match:
+            ports.append(match.group(1))
+for port in dict.fromkeys(ports):
+    print(port)
+PY
+}
+
+listeners_ok() {
+    local cfg ports port
+    cfg="$(find_telemt_config)"
+    [ -n "$cfg" ] || return 1
+    ports="$(configured_ports "$cfg")"
+    [ -n "$ports" ] || return 1
+    while IFS= read -r port; do
+        ss -lntH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}$" || return 1
+    done <<< "$ports"
+}
+
+wait_until_healthy() {
+    local count=0
+    while [ "$count" -lt 15 ]; do
+        if service_active && listeners_ok; then
+            return 0
+        fi
+        sleep 3
+        count=$((count + 1))
+    done
+    return 1
+}
+
+if ! network_ok; then
+    if [ "$WAS_OFFLINE" -eq 0 ]; then
+        log_msg "NETWORK_DOWN: 公网与 Telegram 探测失败，断网期间不反复重启 Telemt"
+    fi
+    WAS_OFFLINE=1
+    FAILURES=0
+    save_state
+    exit 0
+fi
+
+if [ "$WAS_OFFLINE" -eq 1 ]; then
+    WAS_OFFLINE=0
+    FAILURES=0
+    log_msg "NETWORK_RECOVERED: 网络已恢复"
+    if [ "$RESTART_ON_NETWORK_RECOVERY" -eq 1 ]; then
+        log_msg "RECOVERY_RESTART: 网络恢复后重启 Telemt 以重建 Telegram 连接池"
+        if restart_service && wait_until_healthy; then
+            log_msg "RECOVERY_OK: Telemt 服务和全部配置端口已恢复"
+        else
+            log_msg "RECOVERY_FAILED: Telemt 重启后未在限定时间内恢复"
+        fi
+    fi
+    save_state
+    exit 0
+fi
+
+if service_active && listeners_ok; then
+    if [ "$FAILURES" -gt 0 ]; then
+        log_msg "HEALTHY_AGAIN: Telemt 自行恢复，连续失败计数已清零"
+    fi
+    FAILURES=0
+    save_state
+    exit 0
+fi
+
+FAILURES=$((FAILURES + 1))
+log_msg "HEALTH_CHECK_FAILED: Telemt 服务或监听端口异常，连续失败 ${FAILURES}/${FAIL_THRESHOLD}"
+
+if [ "$FAILURES" -ge "$FAIL_THRESHOLD" ]; then
+    log_msg "SERVICE_RESTART: 达到失败阈值，正在重启 Telemt"
+    if restart_service && wait_until_healthy; then
+        log_msg "SERVICE_RECOVERED: Telemt 服务和全部配置端口已恢复"
+        FAILURES=0
+    else
+        log_msg "SERVICE_RECOVERY_FAILED: Telemt 重启后仍异常，下一周期将继续检查"
+    fi
+fi
+save_state
+WATCHDOG
+
+    chmod 700 /usr/local/sbin/telemt-watchdog
+    cat > /etc/telemt-watchdog.conf <<'EOF'
+# 连续多少次检查失败后重启 Telemt
+FAIL_THRESHOLD=3
+
+# 公网从断开变为恢复时，是否重启一次 Telemt（1=是，0=否）
+RESTART_ON_NETWORK_RECOVERY=1
+
+# 单次 TCP 探测超时秒数
+CHECK_TIMEOUT=6
+EOF
+
+    if command -v systemctl >/dev/null 2>&1; then
+        cat > /etc/systemd/system/telemt-watchdog.service <<'EOF'
+[Unit]
+Description=Telemt network and service health watchdog
+After=network-online.target telemt.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/telemt-watchdog
+EOF
+
+        cat > /etc/systemd/system/telemt-watchdog.timer <<'EOF'
+[Unit]
+Description=Run Telemt health watchdog every two minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Persistent=true
+Unit=telemt-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl daemon-reload
+        systemctl enable --now telemt-watchdog.timer
+        systemctl start telemt-watchdog.service
+    else
+        local cron_line='*/2 * * * * /usr/local/sbin/telemt-watchdog >/dev/null 2>&1'
+        (crontab -l 2>/dev/null | grep -v '/usr/local/sbin/telemt-watchdog'; echo "$cron_line") | crontab -
+        /usr/local/sbin/telemt-watchdog
+    fi
+    echo -e "${GREEN}✅ 断网检测与 Telemt 服务自愈已启用（每 2 分钟检查）。${PLAIN}"
+    echo "日志：/var/log/telemt-watchdog.log"
+}
+
+disable_watchdog() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now telemt-watchdog.timer 2>/dev/null || true
+        rm -f /etc/systemd/system/telemt-watchdog.timer /etc/systemd/system/telemt-watchdog.service
+        systemctl daemon-reload
+    fi
+    if command -v crontab >/dev/null 2>&1; then
+        crontab -l 2>/dev/null | grep -v '/usr/local/sbin/telemt-watchdog' | crontab - 2>/dev/null || true
+    fi
+    rm -f /usr/local/sbin/telemt-watchdog /etc/telemt-watchdog.conf /run/telemt-watchdog.state /run/telemt-watchdog.lock
+    echo -e "${GREEN}断网检测与服务自愈已关闭。${PLAIN}"
+    echo "历史日志仍保留在 /var/log/telemt-watchdog.log"
+}
+
+watchdog_status() {
+    echo -e "${BLUE}--- 监控状态 ---${PLAIN}"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-enabled telemt-watchdog.timer 2>/dev/null || true
+        systemctl status telemt-watchdog.timer --no-pager -l 2>/dev/null || true
+    elif crontab -l 2>/dev/null | grep -q '/usr/local/sbin/telemt-watchdog'; then
+        echo "Cron: enabled (every 2 minutes)"
+    else
+        echo "disabled"
+    fi
+    echo
+    echo -e "${BLUE}--- 最近日志 ---${PLAIN}"
+    tail -n 30 /var/log/telemt-watchdog.log 2>/dev/null || echo "暂无日志"
+}
+
+watchdog_menu() {
+    local choice
+    while true; do
+        echo
+        echo -e "${BLUE}====== 断网检测 + Telemt 服务自愈 ======${PLAIN}"
+        echo "  1. 启用/重新安装监控"
+        echo "  2. 立即执行一次健康检查"
+        echo "  3. 查看监控状态和日志"
+        echo "  4. 关闭并删除监控"
+        echo "  0. 返回"
+        read -r -p "请选择 [0-4]: " choice
+        case "$choice" in
+            1) install_watchdog ;;
+            2)
+                if [ -x /usr/local/sbin/telemt-watchdog ]; then
+                    /usr/local/sbin/telemt-watchdog
+                    echo -e "${GREEN}健康检查已执行。${PLAIN}"
+                    tail -n 5 /var/log/telemt-watchdog.log 2>/dev/null || true
+                else
+                    echo -e "${YELLOW}监控尚未安装。${PLAIN}"
+                fi
+                ;;
+            3) watchdog_status ;;
+            4)
+                read -r -p "确定关闭并删除监控？[y/N]: " choice
+                [[ "$choice" =~ ^[yY]$ ]] && disable_watchdog
+                ;;
+            0) return 0 ;;
+            *) echo -e "${RED}无效选项。${PLAIN}" ;;
+        esac
+    done
+}
+
 menu() {
     while true; do
         clear 2>/dev/null || true
@@ -405,9 +698,10 @@ menu() {
         echo "  5. 快速查看所有用户连接链接"
         echo "  6. 进入原 mtp-new.sh 管理菜单"
         echo "  7. 查看 TAG / Middle Proxy / 服务日志"
+        echo "  8. 断网检测 + Telemt 服务自愈监控"
         echo "  0. 退出"
         echo
-        read -r -p "请选择 [0-7]: " choice
+        read -r -p "请选择 [0-8]: " choice
         case "$choice" in
             1) install_telemt; pause_menu ;;
             2) set_global_tag; pause_menu ;;
@@ -419,6 +713,7 @@ menu() {
                 bash "$UPSTREAM_SCRIPT"
                 ;;
             7) show_diagnostics; pause_menu ;;
+            8) watchdog_menu ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选项。${PLAIN}"; sleep 1 ;;
         esac
